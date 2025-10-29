@@ -577,14 +577,19 @@ app.get('/api/unit/:unit', async (req, res) => {
     if (copy.snapshot && Array.isArray(copy.snapshot.bunkerTimers)) {
       const bc = Number(copy.snapshot.bunkerCapacity || 0);
       const flows = Array.isArray(copy.snapshot.flows) ? copy.snapshot.flows : Array(8).fill(0);
-      copy.snapshot.clientBunkers = Array.isArray(copy.snapshot.clientBunkers) ? copy.snapshot.clientBunkers : Array(8).fill(null).map(()=>({ layers: [] }));
+      copy.snapshot.clientBunkers = Array.isArray(copy.snapshot.clientBunkers)
+        ? copy.snapshot.clientBunkers
+        : Array(8).fill(null).map(()=>({ layers: [] }));
 
-      for (let m = 0; m < Math.max(8, (copy.snapshot.bunkerTimers || []).length); m++) {
+      const maxLoop = Math.max(8, (copy.snapshot.bunkerTimers || []).length);
+      for (let m = 0; m < maxLoop; m++) {
         const btimer = (copy.snapshot.bunkerTimers && copy.snapshot.bunkerTimers[m]) ? copy.snapshot.bunkerTimers[m] : null;
         const flow = Number((flows && flows[m]) ? flows[m] : 0);
-        const layerList = (copy.snapshot.clientBunkers && copy.snapshot.clientBunkers[m] && Array.isArray(copy.snapshot.clientBunkers[m].layers)) ? copy.snapshot.clientBunkers[m].layers : [];
+        const layerList = (copy.snapshot.clientBunkers && copy.snapshot.clientBunkers[m] && Array.isArray(copy.snapshot.clientBunkers[m].layers))
+          ? copy.snapshot.clientBunkers[m].layers
+          : [];
 
-        // compute bunkerRemainingSeconds
+        // Compute bunkerRemainingSeconds fallback (we'll recompute from layers after sequential drain)
         let bunkerRemainingSeconds = null;
         if (btimer && btimer.initialSeconds != null) {
           bunkerRemainingSeconds = Math.max(0, Number(btimer.initialSeconds) - elapsedSec);
@@ -598,49 +603,83 @@ app.get('/api/unit/:unit', async (req, res) => {
           }
         }
 
-        // update each layer
-        for (let li = 0; li < layerList.length; li++) {
-          const layer = layerList[li];
-          const initSec = (btimer && btimer.layers && btimer.layers[li] && btimer.layers[li].initialSeconds != null) ? Number(btimer.layers[li].initialSeconds) : null;
+        // SEQUENTIAL draining: consume elapsedSec from bottom layer upwards.
+        // Assumes layerList[0] is bottom, layerList[1] is above, etc. If your ordering is reversed,
+        // iterate in reverse (for loop from end to 0).
+        let remainingElapsed = elapsedSec;
 
-          let remainingSeconds = null;
-          if (initSec != null) {
-            remainingSeconds = Math.max(0, initSec - elapsedSec);
-          } else if (flow > 0 && bc > 0) {
-            const pct = Number(layer.percent || 0);
-            if (pct > 0) {
-              const computedInit = (pct / 100) * bc / flow * 3600;
-              remainingSeconds = Math.max(0, computedInit - elapsedSec);
-            } else {
-              remainingSeconds = 0;
-            }
-          } else {
-            remainingSeconds = null;
-          }
-
-          // compute remaining percent (proportional)
-          let remainingPercent = Number(layer.percent || 0);
-          if (initSec != null && initSec > 0 && remainingSeconds != null) {
-            remainingPercent = (remainingSeconds / initSec) * Number(layer.percent || 0);
-            if (!isFinite(remainingPercent)) remainingPercent = 0;
-          } else if (initSec == null && remainingSeconds != null && flow > 0 && bc > 0) {
-            const pct = Number(layer.percent || 0);
-            const computedInit = (pct / 100) * bc / flow * 3600;
-            if (computedInit > 0) {
-              remainingPercent = (remainingSeconds / computedInit) * pct;
-              if (!isFinite(remainingPercent)) remainingPercent = 0;
-            }
-          }
-
-          remainingPercent = Math.max(0, Number((remainingPercent || 0).toFixed(6)));
-          layer.remainingSeconds = (remainingSeconds == null ? null : Number(remainingSeconds));
-          layer.percent = remainingPercent;
-        } // per-layer
-
+        // ensure bunkerTimers structure exists so we can write initialSeconds for each layer
         if (!copy.snapshot.bunkerTimers) copy.snapshot.bunkerTimers = [];
         if (!copy.snapshot.bunkerTimers[m]) copy.snapshot.bunkerTimers[m] = {};
-        copy.snapshot.bunkerTimers[m].remainingSeconds = (bunkerRemainingSeconds == null ? null : Number(bunkerRemainingSeconds));
-      }
+        if (!copy.snapshot.bunkerTimers[m].layers) copy.snapshot.bunkerTimers[m].layers = copy.snapshot.bunkerTimers[m].layers || [];
+
+        for (let li = 0; li < layerList.length; li++) {
+          const layer = layerList[li];
+
+          // initial seconds for this layer from stored btimer snapshot (if available)
+          const initSecFromBtimer = (btimer && btimer.layers && btimer.layers[li] && btimer.layers[li].initialSeconds != null)
+            ? Number(btimer.layers[li].initialSeconds)
+            : null;
+
+          // treat layer.percent in snapshot as the initial percent at savedAt
+          const initialPercent = Number(layer.percent || 0);
+
+          // compute initSec if not stored, using percent -> seconds formula
+          const computedInit = (flow > 0 && bc > 0 && initialPercent > 0)
+            ? (initialPercent / 100) * bc / flow * 3600
+            : 0;
+
+          const initSec = (initSecFromBtimer != null) ? initSecFromBtimer : computedInit;
+
+          // defaults
+          let remainingSeconds = null;
+          let remainingPercent = 0;
+
+          if (!isFinite(initSec) || initSec <= 0) {
+            // empty or cannot compute
+            remainingSeconds = 0;
+            remainingPercent = 0;
+            // no change to remainingElapsed
+          } else {
+            if (remainingElapsed <= 0) {
+              // no elapsed left to consume — layer unchanged
+              remainingSeconds = initSec;
+              remainingPercent = initialPercent;
+            } else if (remainingElapsed >= initSec) {
+              // this whole layer consumed by elapsed time
+              remainingSeconds = 0;
+              remainingPercent = 0;
+              remainingElapsed = remainingElapsed - initSec;
+            } else {
+              // partially consumed
+              remainingSeconds = Math.max(0, initSec - remainingElapsed);
+              remainingPercent = (remainingSeconds / initSec) * initialPercent;
+              remainingElapsed = 0;
+            }
+          }
+
+          // clamp/round
+          remainingPercent = Math.max(0, Number(Number(remainingPercent || 0).toFixed(6)));
+          layer.remainingSeconds = (remainingSeconds == null ? null : Number(remainingSeconds));
+          layer.percent = remainingPercent;
+
+          // write initialSeconds back into returned snapshot for client convenience (do not overwrite if already present)
+          const writeInit = (initSecFromBtimer != null) ? initSecFromBtimer : (computedInit > 0 ? computedInit : null);
+          if (writeInit != null) {
+            copy.snapshot.bunkerTimers[m].layers[li] = copy.snapshot.bunkerTimers[m].layers[li] || {};
+            copy.snapshot.bunkerTimers[m].layers[li].initialSeconds = Number(writeInit);
+          }
+        } // per-layer loop
+
+        // recompute bunker remaining seconds as sum of remainingSeconds (if available)
+        const sumRemaining = layerList.reduce((s, L) => s + (Number(L.remainingSeconds) || 0), 0);
+        if (sumRemaining > 0) {
+          copy.snapshot.bunkerTimers[m].remainingSeconds = Number(sumRemaining);
+        } else {
+          // fallback to previously computed bunkerRemainingSeconds or zero
+          copy.snapshot.bunkerTimers[m].remainingSeconds = (bunkerRemainingSeconds == null ? 0 : Number(bunkerRemainingSeconds));
+        }
+      } // bunker loop
     }
 
     // include resolved blend for convenience (if blendId present)
@@ -655,6 +694,7 @@ app.get('/api/unit/:unit', async (req, res) => {
     return res.status(500).json({ error: err.message || 'Server error' });
   }
 });
+
 
 /* -------------------- Optional dev helpers -------------------- */
 app.delete('/api/units/reset', async (req, res) => {
