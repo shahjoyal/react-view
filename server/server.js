@@ -21,8 +21,8 @@ app.use(express.json());
 // static files (put dashboard.js / index.html / input.html etc. in ./public)
 app.use(express.static(path.join(__dirname, 'public')));
 
-// root (serve login or input)
-app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
+// // root (serve login or input)
+// app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'login.html')));
 
 // require MONGO_URI
 const MONGO_URI = process.env.MONGO_URI;
