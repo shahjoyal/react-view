@@ -4,6 +4,9 @@ import React, { useEffect, useRef } from "react";
 /**
  * StatsPanel - computes derived metrics (Avg GCV, Avg AFT, Heat Rate, Total Flow)
  * Now prefers reading from window.SNAPSHOT_NORMALIZED (snapshot) when available.
+ *
+ * Change: compute Avg AFT (flow-weighted) and Cost/MT (flow-weighted) from snapshot data (DB),
+ *        do NOT use blend.costRate when snapshot layer costs are available.
  */
 
 export default function StatsPanel() {
@@ -116,19 +119,6 @@ export default function StatsPanel() {
   // bottom selection heuristics (prefer nextBlendBinder activeLayer)
   function getBottomGcvForBunker(blend, coalDB, bunkerIndex, snapshot, clientBunkers) {
     try {
-      // if (typeof window !== "undefined" && window.nextBlendBinder && typeof window.nextBlendBinder.getActiveLayer === "function") {
-      //   const activeLayer = window.nextBlendBinder.getActiveLayer(bunkerIndex);
-      //   if (activeLayer) {
-      //     const g = safeNum(activeLayer.gcv);
-      //     if (g !== null) return g;
-      //     if (activeLayer.coal) {
-      //       const found = findCoalInDbByNameOrId(activeLayer.coal, coalDB, snapshot);
-      //       if (found && (found.gcv !== undefined && found.gcv !== null)) return safeNum(found.gcv);
-      //     }
-      //   }
-      // }
-
-      // prefer clientBunkers (snapshot-normalized) if provided — clientBunkers index 0 = visual bottom
       if (clientBunkers && Array.isArray(clientBunkers) && clientBunkers[bunkerIndex] && Array.isArray(clientBunkers[bunkerIndex].layers)) {
         const layers = clientBunkers[bunkerIndex].layers;
         for (let li = layers.length; li >=0 ; li--) {
@@ -143,7 +133,6 @@ export default function StatsPanel() {
             if (g !== null) return g;
             if (L.coal) {
               const found = findCoalInDbByNameOrId(L.coal, coalDB, snapshot);
-              //console.log(found.gcv)
               if (found && (found.gcv !== undefined && found.gcv !== null)) return safeNum(found.gcv);
             }
           }
@@ -281,6 +270,8 @@ export default function StatsPanel() {
     try {
       if (!blend) return { avgGCV: null, heatRate: null, totalFlow: null, avgAFT: null, costRate: null };
 
+      const snapshot = (typeof window !== "undefined" ? window.SNAPSHOT_NORMALIZED : null);
+
       const bunkerCount = Array.isArray(blend.bunkers) ? Math.min(blend.bunkers.length, 8) : 8;
       let sumNumerator = 0;
       let sumFlowsForNumerator = 0;
@@ -289,11 +280,14 @@ export default function StatsPanel() {
       const bf = safeNum(blend.totalFlow);
       let totalFlow = (bf !== null) ? bf : null;
 
+      // For cost calculation (flow-weighted)
+      let totalTonnageForCost = 0;   // in same unit as flow (TPH basis)
+      let totalCostNumerator = 0;    // currency * ton
+
       for (let b = 0; b < bunkerCount; b++) {
-        const flowVal = getBunkerFlow(blend, b, (typeof window !== 'undefined' ? window.SNAPSHOT_NORMALIZED : null));
-        const bottomGcv = getBottomGcvForBunker(blend, coalDB, b, (typeof window !== 'undefined' ? window.SNAPSHOT_NORMALIZED : null), (typeof window !== 'undefined' && window.SNAPSHOT_NORMALIZED ? (window.SNAPSHOT_NORMALIZED.clientBunkers || window.SNAPSHOT_NORMALIZED.bunkers) : null));
-        //console.log(bottomGcv)       
-        const bottomAft = getBottomAftForBunker(blend, coalDB, b, (typeof window !== 'undefined' ? window.SNAPSHOT_NORMALIZED : null), (typeof window !== 'undefined' && window.SNAPSHOT_NORMALIZED ? (window.SNAPSHOT_NORMALIZED.clientBunkers || window.SNAPSHOT_NORMALIZED.bunkers) : null));
+        const flowVal = getBunkerFlow(blend, b, snapshot);
+        const bottomGcv = getBottomGcvForBunker(blend, coalDB, b, snapshot, (snapshot ? (snapshot.clientBunkers || snapshot.bunkers) : null));
+        const bottomAft = getBottomAftForBunker(blend, coalDB, b, snapshot, (snapshot ? (snapshot.clientBunkers || snapshot.bunkers) : null));
 
         if (flowVal !== null && bottomGcv !== null) {
           sumNumerator += Number(bottomGcv) * Number(flowVal);
@@ -302,15 +296,104 @@ export default function StatsPanel() {
         if (flowVal !== null && bottomAft !== null) {
           sumAftNumerator += Number(bottomAft) * Number(flowVal);
         }
-      }
+
+        // --- Flow-weighted cost computation using snapshot (DB) first, then blend layers, then coalDB ---
+        // prefer snapshot.clientBunkers if present (structure similar to blend.bunkers)
+        const layerSource = (snapshot && Array.isArray(snapshot.clientBunkers) && snapshot.clientBunkers[b] && Array.isArray(snapshot.clientBunkers[b].layers))
+          ? snapshot.clientBunkers[b].layers
+          : (Array.isArray(blend.bunkers) && blend.bunkers[b] && Array.isArray(blend.bunkers[b].layers) ? blend.bunkers[b].layers : []);
+
+        if (flowVal !== null && Array.isArray(layerSource) && layerSource.length) {
+          for (let li = 0; li < layerSource.length; li++) {
+            const L = layerSource[li];
+            if (!L) continue;
+            // read pct (allow arrays or single numbers)
+            let rawPct = (L.percent === undefined || L.percent === null) ? (L.percentages ? L.percentages : 0) : L.percent;
+            let pctVal = null;
+            if (Array.isArray(rawPct) && rawPct.length) pctVal = safeNum(rawPct[0]);
+            else pctVal = safeNum(rawPct);
+            if (!pctVal || pctVal <= 0) continue; // nothing from this layer
+
+            const tonnage = (pctVal / 100) * Number(flowVal); // relative tonnage (TPH basis)
+
+            // find cost for this coal/layer: prefer snapshot layer fields
+            let costPerTon = null;
+            const possibleFields = ["cost", "price", "costRate", "rate", "cost_per_ton", "costMT", "costPerTon", "pricePerTon"];
+
+            // 1) check layer object itself (snapshot priority)
+            for (let f of possibleFields) {
+              if (L[f] !== undefined && L[f] !== null) {
+                const c = safeNum(L[f]);
+                if (c !== null) { costPerTon = c; break; }
+              }
+            }
+
+            // 2) if layer has a coal reference, try snapshot.coals first then coalDB
+            if (costPerTon === null && L.coal) {
+              const foundInSnapshot = snapshot && Array.isArray(snapshot.coals) ? snapshot.coals.find(c => {
+                if (!c) return false;
+                if (c.coal && String(c.coal).trim().toLowerCase() === String(L.coal).trim().toLowerCase()) return true;
+                if (c.name && String(c.name).trim().toLowerCase() === String(L.coal).trim().toLowerCase()) return true;
+                if ((c._id || c.id) && String(c._id || c.id) === String(L.coal)) return true;
+                return false;
+              }) : null;
+              if (foundInSnapshot) {
+                for (let f of possibleFields) {
+                  if (foundInSnapshot[f] !== undefined && foundInSnapshot[f] !== null) {
+                    const c = safeNum(foundInSnapshot[f]);
+                    if (c !== null) { costPerTon = c; break; }
+                  }
+                }
+              }
+              // 3) fallback to coalDB
+              if (costPerTon === null) {
+                const foundInDb = findCoalInDbByNameOrId(L.coal, coalDB, snapshot);
+                if (foundInDb) {
+                  for (let f of possibleFields) {
+                    if (foundInDb[f] !== undefined && foundInDb[f] !== null) {
+                      const c = safeNum(foundInDb[f]);
+                      if (c !== null) { costPerTon = c; break; }
+                    }
+                  }
+                }
+              }
+            }
+
+            // 4) if still null and layer has coalDoc object, check it
+            if (costPerTon === null && L.coalDoc) {
+              for (let f of possibleFields) {
+                if (L.coalDoc[f] !== undefined && L.coalDoc[f] !== null) {
+                  const c = safeNum(L.coalDoc[f]);
+                  if (c !== null) { costPerTon = c; break; }
+                }
+              }
+            }
+
+            // accumulate cost only if we have a costPerTon
+            if (costPerTon !== null) {
+              totalTonnageForCost += tonnage;
+              totalCostNumerator += tonnage * Number(costPerTon);
+            }
+          } // layers loop
+        }
+      } // bunker loop
 
       if (totalFlow === null) {
         totalFlow = (sumFlowsForNumerator > 0) ? sumFlowsForNumerator : null;
       }
 
       const avgGCV = (totalFlow && totalFlow > 0) ? (sumNumerator / totalFlow) : null;
-      //console.log(avgGCV)
-      const avgAFT = (totalFlow && totalFlow > 0 && sumAftNumerator > 0) ? (sumAftNumerator / totalFlow) : null;
+      // avgAFT using flow-weighted average (only AFT)
+      const avgAFT = (totalFlow && totalFlow > 0 && sumAftNumerator >= 0) ? (sumAftNumerator / totalFlow) : null;
+
+      // compute flow-weighted cost/MT (if we found any cost info)
+      let costRate = null;
+      if (totalTonnageForCost > 0) {
+        costRate = totalCostNumerator / totalTonnageForCost;
+      } else {
+        // fallback to blend.costRate only if no per-layer cost info
+        costRate = (blend.costRate !== undefined ? safeNum(blend.costRate) : null);
+      }
 
       const generation = safeNum(blend.generation);
       let heatRate = null;
@@ -320,8 +403,6 @@ export default function StatsPanel() {
         const hr = safeNum(blend.heatRate);
         heatRate = (hr !== null) ? hr : null;
       }
-
-      const costRate = (blend.costRate !== undefined ? blend.costRate : null);
 
       return {
         avgGCV: avgGCV === null ? null : Number(avgGCV),
@@ -375,7 +456,7 @@ export default function StatsPanel() {
         avgGCV: (derived.avgGCV !== null ? derived.avgGCV : (blend.avgGCV !== undefined ? blend.avgGCV : null)),
         avgAFT: (derived.avgAFT !== null ? derived.avgAFT : (blend.avgAFT !== undefined ? blend.avgAFT : null)),
         heatRate: (derived.heatRate !== null ? derived.heatRate : (blend.heatRate !== undefined ? blend.heatRate : null)),
-        costRate: (blend.costRate !== undefined ? blend.costRate : null)
+        costRate: (derived.costRate !== null ? derived.costRate : (blend.costRate !== undefined ? blend.costRate : null))
       };
 
       if (typeof window !== "undefined" && typeof window.populateStats === "function") {
@@ -384,7 +465,7 @@ export default function StatsPanel() {
       populateStats(metrics);
     } catch (e) {
       try {
-        if (typeof window !== "undefined" && typeof window.populateStats === "function") window.populateStats({});
+        if (typeof window !== "undefined" && typeof window.populateStats === "function") window.populateStats({}); 
       } catch (ee) {}
     }
   }
