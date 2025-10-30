@@ -434,7 +434,7 @@ function computeDerivedMetricsLocalFromSnapshot(snapshotBlend, coalDB, snapshot,
     - blend, coalDB, onOpenSingle as before
 */
 export default function BunkersGrid({
-  apiBase = 'http://localhost:5000/api',
+  apiBase = (typeof window !== 'undefined' && window.__API_BASE__) ? window.__API_BASE__ : '/api',
   activeUnit = 1,
   blend = {},
   coalDB = [],
@@ -1330,3 +1330,4 @@ const derivedAndEstGen = useMemo(() => {
     </>
   );
 }
+
