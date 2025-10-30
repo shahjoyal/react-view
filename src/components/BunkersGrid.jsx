@@ -1,5 +1,5 @@
 // src/components/BunkersGrid.jsx
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useRef } from 'react';
 
 // --- minimal in-app SVG bunker renderer (safe fallback if dashboard.js is removed) ---
 // (unchanged renderer code - kept as in your file)
@@ -171,7 +171,7 @@ function calcAFT(ox) {
   const total = ["SiO2","Al2O3","Fe2O3","CaO","MgO","Na2O","K2O","SO3","TiO2"]
     .reduce((s,k)=> s + (Number(ox[k])||0), 0);
   if (total === 0) return null;
-  const SiO2 = Number(ox.SiO2)||0, Al2O3 = Number(ox.Al2O3)||0, Fe2O3 = Number(ox.Fe2O3)||0;
+  const SiO2 = Number(ox.SiO2)||0, Al2O3 = Number(ox.Al2O)||0, Fe2O3 = Number(ox.Fe2O3)||0;
   const CaO = Number(ox.CaO)||0, MgO = Number(ox.MgO)||0, Na2O = Number(ox.Na2O)||0, K2O = Number(ox.K2O)||0;
   const SO3 = Number(ox.SO3)||0, TiO2 = Number(ox.TiO2)||0;
   const sum = SiO2 + Al2O3;
@@ -326,7 +326,6 @@ function getComputeBottomGcv(clientBunkers, coalDB, bunkerIndex, snapshot) {
 }
 
 /* ---------- compute next-above layer GCV + layer object ---------- */
-/* ---------- next-above helpers (keep bottom-GCV loop unchanged elsewhere) ---------- */
 function getComputeNextAboveGcv(clientBunkers, coalDB, bunkerIndex, snapshot) {
   try {
     if (!Array.isArray(clientBunkers) || !clientBunkers[bunkerIndex]) return null;
@@ -579,7 +578,7 @@ export default function BunkersGrid({
   const [timers, setTimers] = useState(initialTimers);
   useEffect(() => { setTimers(initialTimers); }, [initialTimers]);
 
-  // tick whole-bunker timers every second
+  // tick whole-bunker timers every second (visual drain driver)
   useEffect(() => {
     const id = setInterval(() => {
       setTimers(prev => {
@@ -630,7 +629,7 @@ export default function BunkersGrid({
     });
   }, [snapshot]);
 
-  // activeLayerTimers kept for backward compatibility but not used to drive drain (we keep the state but don't change behavior)
+  // activeLayerTimers kept for backward compatibility but not used to drive drain (unchanged)
   const [activeLayerTimers, setActiveLayerTimers] = useState(() => Array(NUM).fill(null));
   useEffect(() => {
     try {
@@ -669,6 +668,183 @@ export default function BunkersGrid({
     } catch (e) { /* swallow */ }
   }, [snapshot, clientBunkers]);
 
+  // ----- per-bunker layer queues + robust ticking (uses refs to avoid snapshot stomping) -----
+  const [layerQueues, setLayerQueues] = useState(() => Array(NUM).fill([])); // kept in state for debug/inspection if needed
+  const layerQueuesRef = useRef(Array(NUM).fill([]));
+  const [activeLayerIndex, setActiveLayerIndex] = useState(() => Array(NUM).fill(0));
+  const activeLayerIndexRef = useRef(Array(NUM).fill(0));
+  const [displayTimers, setDisplayTimers] = useState(() => Array(NUM).fill(null)); // currently displayed layer remaining seconds
+
+  // ---------- snapshot -> queue merge effect (final: no upward sync for same layer) ----------
+  useEffect(() => {
+    if (!snapshot) return;
+
+    const SYNC_THRESHOLD = 2; // seconds. adjust up if you want more tolerance
+
+    // build server-side queues (same as before)
+    const serverQueues = Array.from({ length: NUM }).map(() => []);
+    for (let m = 0; m < NUM; m++) {
+      const bun = (snapshot.clientBunkers && snapshot.clientBunkers[m]) || (snapshot.bunkers && snapshot.bunkers[m]) || { layers: [] };
+      const bt = (Array.isArray(snapshot.bunkerTimers) && snapshot.bunkerTimers[m]) ? snapshot.bunkerTimers[m] : null;
+      const srcLayers = (bt && Array.isArray(bt.layers) && bt.layers.length) ? bt.layers : bun.layers || [];
+
+      serverQueues[m] = (srcLayers || []).map(L => {
+        const initial = safeNum(L && (L.initialSeconds != null ? L.initialSeconds : L.initial_seconds)) || 0;
+        const remaining = (safeNum(L && L.remainingSeconds) != null) ? safeNum(L.remainingSeconds) : initial;
+        return { initial: Number(initial || 0), remaining: (remaining == null ? 0 : Number(remaining)) };
+      });
+    }
+
+    // update ref + state of queues (for renderer / debugging)
+    layerQueuesRef.current = serverQueues;
+    setLayerQueues(prev => {
+      try {
+        const a = JSON.stringify(prev || []);
+        const b = JSON.stringify(serverQueues || []);
+        return a === b ? prev : serverQueues;
+      } catch (e) { return serverQueues; }
+    });
+
+    // Merge/sync display timers — IMPORTANT: do NOT sync upward for the same active layer.
+    setDisplayTimers(prevDisplay => {
+      const nextDisplay = prevDisplay.slice();
+      const nextActiveIdx = activeLayerIndexRef.current.slice();
+      let anyChange = false;
+
+      for (let i = 0; i < NUM; i++) {
+        const q = serverQueues[i] || [];
+
+        // serverActive: first layer with remaining > 0 (like client expects)
+        let serverActive = -1;
+        for (let k = 0; k < q.length; k++) {
+          if (q[k] && isFinite(q[k].remaining) && q[k].remaining > 0) { serverActive = k; break; }
+        }
+        const serverRemaining = (serverActive >= 0 && q[serverActive]) ? q[serverActive].remaining : null;
+
+        const clientRemaining = prevDisplay[i];
+        const clientActive = (activeLayerIndexRef.current && typeof activeLayerIndexRef.current[i] !== 'undefined') ? activeLayerIndexRef.current[i] : null;
+
+        if (clientRemaining == null) {
+          // client has no running timer: initialize from server if available
+          if (serverRemaining != null) {
+            nextDisplay[i] = serverRemaining;
+            nextActiveIdx[i] = serverActive >= 0 ? serverActive : 0;
+            anyChange = true;
+          }
+          // else keep null
+        } else {
+          // client is running a timer. Be conservative — avoid restarting/increasing it.
+          if (serverActive === -1) {
+            // server reports no active layer: do not stomp an in-progress client timer (preserve client)
+          } else if (serverActive !== clientActive) {
+            // server changed active layer (advance/replaced). Trust server authority here.
+            nextDisplay[i] = serverRemaining;
+            nextActiveIdx[i] = serverActive;
+            anyChange = true;
+          } else {
+            // same active layer on both sides — only sync **downwards** (server shows less time)
+            // and only if difference exceeds threshold or server is strictly less.
+            if (serverRemaining != null) {
+              if (serverRemaining < clientRemaining - SYNC_THRESHOLD) {
+                nextDisplay[i] = serverRemaining;
+                anyChange = true;
+              }
+              // IMPORTANT: DO NOT set nextDisplay to a *larger* serverRemaining (no upward sync)
+            }
+          }
+        }
+      } // end for each bunker
+
+      if (anyChange) {
+        // persist updated active indices
+        activeLayerIndexRef.current = nextActiveIdx;
+        setActiveLayerIndex(prev => {
+          try {
+            const a = JSON.stringify(prev || []);
+            const b = JSON.stringify(nextActiveIdx || []);
+            return a === b ? prev : nextActiveIdx;
+          } catch (e) { return nextActiveIdx; }
+        });
+        return nextDisplay;
+      }
+      return prevDisplay;
+    });
+
+  }, [snapshot]);
+
+  // Single stable interval to tick display timers and advance layers
+  useEffect(() => {
+    const id = setInterval(() => {
+      setDisplayTimers(prev => {
+        const next = prev.slice();
+        let changed = false;
+
+        for (let i = 0; i < NUM; i++) {
+          const cur = next[i];
+
+          if (cur == null) {
+            // nothing currently displayed: try to pick first non-empty in queue (only if previously null)
+            const q = layerQueuesRef.current[i] || [];
+            let foundIdx = -1;
+            for (let k = 0; k < q.length; k++) {
+              if (q[k] && isFinite(q[k].remaining) && q[k].remaining > 0) { foundIdx = k; break; }
+            }
+            if (foundIdx >= 0) {
+              next[i] = layerQueuesRef.current[i][foundIdx].remaining;
+              activeLayerIndexRef.current[i] = foundIdx;
+              setActiveLayerIndex(prevIdx => {
+                const cp = prevIdx.slice();
+                cp[i] = foundIdx;
+                return cp;
+              });
+              changed = true;
+            }
+            continue;
+          }
+
+          if (!isFinite(cur) || cur <= 0) {
+            // current layer finished -> advance to next available
+            const q = layerQueuesRef.current[i] || [];
+            const ai = (activeLayerIndexRef.current[i] != null) ? activeLayerIndexRef.current[i] : 0;
+            let found = -1;
+            for (let k = ai + 1; k < q.length; k++) {
+              if (q[k] && isFinite(q[k].remaining) && q[k].remaining > 0) { found = k; break; }
+            }
+            if (found >= 0) {
+              next[i] = q[found].remaining;
+              activeLayerIndexRef.current[i] = found;
+              setActiveLayerIndex(prevIdx => {
+                const cp = prevIdx.slice();
+                cp[i] = found;
+                return cp;
+              });
+              changed = true;
+            } else {
+              // no more layers -> mark null
+              if (next[i] !== null) { next[i] = null; changed = true; }
+            }
+          } else {
+            // decrement by 1 second
+            next[i] = Math.max(0, Math.round(cur - 1));
+            changed = true;
+          }
+        }
+
+        return changed ? next : prev;
+      });
+    }, 1000);
+
+    return () => clearInterval(id);
+  }, []); // created once
+
+  /* Helper for UI: show displayTimers[idx] if present else fallback to bunker timers (sum) or '--' */
+  function displayedLayerTimerFor(idx) {
+    const dt = displayTimers && displayTimers[idx] != null ? displayTimers[idx] : null;
+    if (dt != null) return secondsToHHMMSS(dt);
+    const secs = (timers && timers[idx] != null) ? timers[idx] : '--';
+    return secs === '--' ? '--' : secondsToHHMMSS(secs);
+  }
+
   function safeFmt(v) {
     if (v === null || typeof v === 'undefined') return '--';
     if (typeof v === 'number') return Number.isFinite(v) ? v : '--';
@@ -686,7 +862,7 @@ export default function BunkersGrid({
     return names.length ? names.join(', ') : '--';
   }
 
-  // Next batch summary now shows the whole-bunker timer (timers[idx])
+  // Next batch summary now shows the whole-bunker timer (timers[idx]) by default — we will use displayedLayerTimerFor when rendering the UI.
   function nextBatchSummaryLocal(idx) {
     const secs = (timers && timers[idx] != null) ? timers[idx] : '--';
     return secs === '--' ? '--' : secondsToHHMMSS(secs);
@@ -1050,10 +1226,9 @@ const derivedAndEstGen = useMemo(() => {
         <div className="coal-flow-title">Next Coal Batch</div>
         <div className="coal-flow-grid" id="nextBlendGrid">
           {Array.from({ length: NUM }).map((_, idx) => {
-            // remove colour functionality (keep plain look)
-            // add blinking red when time < 1 hour (3600s)
-            const secs = (timers && timers[idx] != null) ? timers[idx] : null;
-            const shouldBlink = (secs != null && secs > 0 && secs < 3600);
+            // now use per-layer displayed timers if present, fallback to bunker timer
+            const displayRaw = (displayTimers && displayTimers[idx] != null) ? displayTimers[idx] : ((timers && timers[idx] != null) ? timers[idx] : null);
+            const shouldBlink = (displayRaw != null && displayRaw > 0 && displayRaw < 3600); // blink if less than 1 hour in displayed timer
 
             // find active layer for hover tooltip but do NOT use its color for box background
             const activeLayer = getActiveLayerBottom(idx);
@@ -1082,7 +1257,7 @@ const derivedAndEstGen = useMemo(() => {
                   }}
                   onMouseLeave={() => { try { hideTooltip(); } catch(err) {} }}
                 >
-                  { nextBatchSummaryLocal(idx) }
+                  { displayedLayerTimerFor(idx) }
                 </div>
                 <div className="label">Coal Mill {String.fromCharCode(65 + idx)}</div>
               </div>
@@ -1110,9 +1285,11 @@ const derivedAndEstGen = useMemo(() => {
         }
       } catch (e) { nextGcv = null; }
 
-      const bg = colorFromGcv(nextGcv);
-
+      // === CHANGE: prefer the coal/layer explicit color (same as tooltip/hover),
+      // fallback to colorFromGcv only if no explicit color found ===
       const coalName = nextLayer && (nextLayer.coal || (nextLayer.coalDoc && (nextLayer.coalDoc.coal || nextLayer.coalDoc.name)));
+      const bg = pickColorForCoalLocal(coalName, coalDB, snapshot, nextLayer) || colorFromGcv(nextGcv);
+
       const val = derivedAndEstGen && Array.isArray(derivedAndEstGen.perBunkerNextEst24)
         ? derivedAndEstGen.perBunkerNextEst24[idx]
         : '--';
