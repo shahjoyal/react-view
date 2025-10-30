@@ -559,7 +559,7 @@ app.post('/api/submit/:unit', async (req, res) => {
   }
 });
 
-/* -------------------- GET unit: returns snapshot with remaining time adjusted by elapsed ------------ */
+/* -------------------- GET unit: returns snapshot with remaining time adjusted by elapsed (sequential drain) ------------ */
 app.get('/api/unit/:unit', async (req, res) => {
   try {
     const unit = Number(req.params.unit || 0);
@@ -570,9 +570,13 @@ app.get('/api/unit/:unit', async (req, res) => {
 
     // deep-copy to avoid mutating DB object
     const copy = JSON.parse(JSON.stringify(unitDoc));
-    const savedAt = copy.savedAt ? new Date(copy.savedAt) : new Date();
+
+    // authoritative timestamp: prefer savedAt, then updatedAt, then createdAt, then now
+    const savedAt = copy.savedAt ? new Date(copy.savedAt)
+                  : (copy.updatedAt ? new Date(copy.updatedAt)
+                  : (copy.createdAt ? new Date(copy.createdAt) : new Date()));
     const now = new Date();
-    const elapsedSec = Math.max(0, (now.getTime() - savedAt.getTime()) / 1000);
+    const elapsedSinceSaved = Math.max(0, (now.getTime() - savedAt.getTime()) / 1000);
 
     if (copy.snapshot && Array.isArray(copy.snapshot.bunkerTimers)) {
       const bc = Number(copy.snapshot.bunkerCapacity || 0);
@@ -589,60 +593,45 @@ app.get('/api/unit/:unit', async (req, res) => {
           ? copy.snapshot.clientBunkers[m].layers
           : [];
 
-        // Compute bunkerRemainingSeconds fallback (we'll recompute from layers after sequential drain)
-        let bunkerRemainingSeconds = null;
-        if (btimer && btimer.initialSeconds != null) {
-          bunkerRemainingSeconds = Math.max(0, Number(btimer.initialSeconds) - elapsedSec);
-        } else {
-          const totalPct = layerList.reduce((s, L) => s + (Number(L.percent)||0), 0);
-          if (flow > 0 && bc > 0 && totalPct > 0) {
-            const initial = (totalPct / 100) * bc / flow * 3600;
-            bunkerRemainingSeconds = Math.max(0, initial - elapsedSec);
-          } else {
-            bunkerRemainingSeconds = null;
-          }
-        }
-
-        // SEQUENTIAL draining: consume elapsedSec from bottom layer upwards.
-        // Assumes layerList[0] is bottom, layerList[1] is above, etc. If your ordering is reversed,
-        // iterate in reverse (for loop from end to 0).
-        let remainingElapsed = elapsedSec;
-
-        // ensure bunkerTimers structure exists so we can write initialSeconds for each layer
+        // Pre-create bunkerTimers entry/structure if missing so we can write back
         if (!copy.snapshot.bunkerTimers) copy.snapshot.bunkerTimers = [];
         if (!copy.snapshot.bunkerTimers[m]) copy.snapshot.bunkerTimers[m] = {};
-        if (!copy.snapshot.bunkerTimers[m].layers) copy.snapshot.bunkerTimers[m].layers = copy.snapshot.bunkerTimers[m].layers || [];
+        if (!Array.isArray(copy.snapshot.bunkerTimers[m].layers)) copy.snapshot.bunkerTimers[m].layers = [];
+
+        // SEQUENTIAL draining: consume elapsedSinceSaved from bottom layer upwards.
+        // Assumes layerList[0] is visual bottom, layerList[1] above it, etc.
+        // For each layer we prefer to use initialSeconds from btimer.layers[*].initialSeconds if present,
+        // otherwise compute initialSeconds from percent -> seconds formula (percent of bunkerCapacity / flow * 3600).
+        let remainingElapsed = elapsedSinceSaved;
 
         for (let li = 0; li < layerList.length; li++) {
-          const layer = layerList[li];
+          const layer = layerList[li] || {};
+          const btLayer = (btimer && Array.isArray(btimer.layers) && btimer.layers[li]) ? btimer.layers[li] : null;
 
-          // initial seconds for this layer from stored btimer snapshot (if available)
-          const initSecFromBtimer = (btimer && btimer.layers && btimer.layers[li] && btimer.layers[li].initialSeconds != null)
-            ? Number(btimer.layers[li].initialSeconds)
-            : null;
+          // initialPercent from clientBunkers.layers (treated as percent at savedAt if no btLayer values)
+          const initialPercent = Number(layer.percent || layer.initialPercent || 0);
 
-          // treat layer.percent in snapshot as the initial percent at savedAt
-          const initialPercent = Number(layer.percent || 0);
-
-          // compute initSec if not stored, using percent -> seconds formula
+          // compute base computedInit if we need to derive from percent
           const computedInit = (flow > 0 && bc > 0 && initialPercent > 0)
             ? (initialPercent / 100) * bc / flow * 3600
             : 0;
 
-          const initSec = (initSecFromBtimer != null) ? initSecFromBtimer : computedInit;
+          // Prefer explicit initialSeconds stored in btimer.layers; else use computedInit
+          const initSecFromBtimer = (btLayer && btLayer.initialSeconds != null) ? Number(btLayer.initialSeconds) : null;
+          const initSec = (initSecFromBtimer != null) ? Number(initSecFromBtimer) : (computedInit > 0 ? Number(computedInit) : 0);
 
           // defaults
-          let remainingSeconds = null;
+          let remainingSeconds = 0;
           let remainingPercent = 0;
 
           if (!isFinite(initSec) || initSec <= 0) {
-            // empty or cannot compute
+            // empty or cannot compute -> nothing in this layer
             remainingSeconds = 0;
             remainingPercent = 0;
-            // no change to remainingElapsed
+            // remainingElapsed unchanged
           } else {
             if (remainingElapsed <= 0) {
-              // no elapsed left to consume — layer unchanged
+              // no elapsed left to consume — layer unchanged (full initSec remains)
               remainingSeconds = initSec;
               remainingPercent = initialPercent;
             } else if (remainingElapsed >= initSec) {
@@ -651,10 +640,10 @@ app.get('/api/unit/:unit', async (req, res) => {
               remainingPercent = 0;
               remainingElapsed = remainingElapsed - initSec;
             } else {
-              // partially consumed
+              // partially consumed: subtract remainingElapsed from this layer only
               remainingSeconds = Math.max(0, initSec - remainingElapsed);
               remainingPercent = (remainingSeconds / initSec) * initialPercent;
-              remainingElapsed = 0;
+              remainingElapsed = 0; // all elapsed consumed
             }
           }
 
@@ -669,6 +658,9 @@ app.get('/api/unit/:unit', async (req, res) => {
             copy.snapshot.bunkerTimers[m].layers[li] = copy.snapshot.bunkerTimers[m].layers[li] || {};
             copy.snapshot.bunkerTimers[m].layers[li].initialSeconds = Number(writeInit);
           }
+          // write canonical remainingSeconds for client
+          copy.snapshot.bunkerTimers[m].layers[li] = copy.snapshot.bunkerTimers[m].layers[li] || {};
+          copy.snapshot.bunkerTimers[m].layers[li].remainingSeconds = Number(remainingSeconds);
         } // per-layer loop
 
         // recompute bunker remaining seconds as sum of remainingSeconds (if available)
@@ -676,8 +668,12 @@ app.get('/api/unit/:unit', async (req, res) => {
         if (sumRemaining > 0) {
           copy.snapshot.bunkerTimers[m].remainingSeconds = Number(sumRemaining);
         } else {
-          // fallback to previously computed bunkerRemainingSeconds or zero
-          copy.snapshot.bunkerTimers[m].remainingSeconds = (bunkerRemainingSeconds == null ? 0 : Number(bunkerRemainingSeconds));
+          // fallback to btimer.initialSeconds minus elapsedSinceSaved if layers empty or all zero
+          if (btimer && btimer.initialSeconds != null) {
+            copy.snapshot.bunkerTimers[m].remainingSeconds = Math.max(0, Number(btimer.initialSeconds) - elapsedSinceSaved);
+          } else {
+            copy.snapshot.bunkerTimers[m].remainingSeconds = 0;
+          }
         }
       } // bunker loop
     }
@@ -694,6 +690,8 @@ app.get('/api/unit/:unit', async (req, res) => {
     return res.status(500).json({ error: err.message || 'Server error' });
   }
 });
+
+
 
 
 /* -------------------- Optional dev helpers -------------------- */
